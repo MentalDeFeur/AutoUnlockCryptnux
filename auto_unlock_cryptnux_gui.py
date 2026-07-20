@@ -60,10 +60,6 @@ class Worker(QThread):
                     self.kwargs['device'], self.kwargs['pcr']
                 )
                 if ok:
-                    mapping = f"luks_{Path(self.kwargs['device']).name.replace('-', '_')}"
-                    tpm2.configure_crypttab_tpm2(self.kwargs['device'], mapping)
-                    self.log_msg.emit("Mise à jour de l'initramfs...")
-                    tpm2.update_initramfs()
                     self.success.emit(msg)
                 else:
                     self.failure.emit(msg)
@@ -113,13 +109,13 @@ class BindDialog(QDialog):
         layout.addWidget(self.combo)
 
         layout.addWidget(QLabel("PCR IDs (ex: 7  ou  0,1,7) :"))
-        self.pcr_edit = QLineEdit("7")
-        self.pcr_edit.setPlaceholderText("7")
+        self.pcr_edit = QLineEdit("0+2+4+7")
+        self.pcr_edit.setPlaceholderText("0+2+4+7")
         layout.addWidget(self.pcr_edit)
 
         note = QLabel(
-            "PCR 7 = Secure Boot (recommandé)\n"
-            "PCR 0,1,2 = Firmware/BIOS (attention: change à chaque MAJ BIOS)"
+            "PCR 0+2+4+7 = configuration recommandée pour le workflow centralisé\n"
+            "Vous pouvez également saisir une liste comme 0,1,7"
         )
         note.setStyleSheet("color: gray; font-size: 11px;")
         layout.addWidget(note)
@@ -134,7 +130,7 @@ class BindDialog(QDialog):
         return self.combo.currentData()
 
     def get_pcr(self):
-        return self.pcr_edit.text().strip() or '7'
+        return self.pcr_edit.text().strip() or '0+2+4+7'
 
 
 # ---------------------------------------------------------------------------

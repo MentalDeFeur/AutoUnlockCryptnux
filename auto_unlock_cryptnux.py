@@ -25,11 +25,11 @@ def check_root():
 
 
 def get_tpm2_backend():
-    """Retourne 'clevis' | 'systemd-cryptenroll' | None"""
-    if shutil.which('clevis'):
-        return 'clevis'
+    """Retourne 'systemd-cryptenroll' | 'clevis' | None"""
     if shutil.which('systemd-cryptenroll'):
         return 'systemd-cryptenroll'
+    if shutil.which('clevis'):
+        return 'clevis'
     return None
 
 
@@ -53,6 +53,54 @@ def check_tpm2_available():
         if Path(dev).exists():
             return True, dev
     return False, None
+
+
+def normalize_pcr_ids(pcr_ids='0+2+4+7'):
+    """Normalise les ids PCR en une chaîne compatible avec systemd-cryptenroll."""
+    if pcr_ids is None:
+        return '0+2+4+7'
+    if isinstance(pcr_ids, (list, tuple)):
+        values = [str(v).strip() for v in pcr_ids if str(v).strip()]
+        return '+'.join(values) if values else '0+2+4+7'
+
+    text = str(pcr_ids).strip()
+    if not text:
+        return '0+2+4+7'
+    if '+' in text:
+        values = [part.strip() for part in text.split('+') if part.strip()]
+        return '+'.join(values) if values else '0+2+4+7'
+
+    values = [part.strip() for part in text.replace(' ', '').split(',') if part.strip()]
+    return '+'.join(values) if values else '0+2+4+7'
+
+
+def build_single_tpm2_workflow_command(device=None, pcr_ids='0+2+4+7'):
+    """Construit la commande unique qui enrolle la clé TPM2 et met à jour crypttab/initramfs."""
+    pcrs = normalize_pcr_ids(pcr_ids)
+    target = device or '$(lsblk -lno NAME,FSTYPE | awk \'$2=="crypto_LUKS"{print "/dev/"$1; exit}\')'
+    prefix = 'sudo ' if os.geteuid() != 0 else ''
+    return (
+        f"{prefix}systemd-cryptenroll --tpm2-device=auto --tpm2-pcrs={pcrs} {target} "
+        f"&& {prefix}sed -i '/crypto_LUKS\\|luks-/s/none/none tpm2-device=auto/' /etc/crypttab "
+        f"&& {prefix}dracut -f --regenerate-all"
+    )
+
+
+def run_single_tpm2_workflow(device=None, pcr_ids='0+2+4+7'):
+    """Exécute le workflow TPM2 via une seule commande centralisée."""
+    command = build_single_tpm2_workflow_command(device, pcr_ids)
+    try:
+        result = subprocess.run(command, shell=True, timeout=1800, capture_output=True, text=True)
+        if result.returncode == 0:
+            return True, "Workflow TPM2 centralisé exécuté avec succès"
+        stderr = (result.stderr or '').strip()
+        stdout = (result.stdout or '').strip()
+        detail = stderr or stdout or f"code {result.returncode}"
+        return False, detail
+    except subprocess.TimeoutExpired:
+        return False, "Timeout pendant l'exécution du workflow TPM2"
+    except Exception as e:
+        return False, str(e)
 
 
 # ---------------------------------------------------------------------------
@@ -132,46 +180,23 @@ def get_tpm2_binding_status(device):
 # Liaison LUKS → TPM2
 # ---------------------------------------------------------------------------
 
-def bind_luks_to_tpm2(device, pcr_ids='7'):
-    """
-    Lie le périphérique LUKS au TPM2 en utilisant le backend disponible.
-    Demande le mot de passe LUKS de manière interactive.
-    Retourne (bool, message).
-    """
+def bind_luks_to_tpm2(device=None, pcr_ids='0+2+4+7'):
+    """Lie le périphérique LUKS au TPM2 via une commande unique centralisée."""
     backend = get_tpm2_backend()
     if backend is None:
         return False, "Aucun backend TPM2 disponible (installez clevis-luks ou systemd 248+)"
 
-    if backend == 'clevis':
-        pcr_cfg = json.dumps({"pcr_ids": pcr_ids}) if pcr_ids else '{}'
-        print(f"  Méthode : clevis-tpm2  (PCR : {pcr_ids})")
-        print("  Entrez le mot de passe LUKS actuel :")
-        try:
-            r = subprocess.run(
-                ['clevis', 'luks', 'bind', '-d', device, 'tpm2', pcr_cfg],
-                timeout=120
-            )
-            if r.returncode == 0:
-                return True, "Liaison clevis-tpm2 réussie"
-            return False, f"clevis a échoué (code {r.returncode})"
-        except subprocess.TimeoutExpired:
-            return False, "Timeout"
-        except Exception as e:
-            return False, str(e)
+    if backend != 'systemd-cryptenroll':
+        return False, "Cette refonte centralisée est dédiée à systemd-cryptenroll"
 
-    # systemd-cryptenroll
-    print(f"  Méthode : systemd-cryptenroll  (PCR : {pcr_ids})")
-    print("  Entrez le mot de passe LUKS actuel :")
-    cmd = ['systemd-cryptenroll', '--tpm2-device=auto', device]
-    if pcr_ids:
-        cmd.append(f'--tpm2-pcrs={pcr_ids}')
+    if device is None:
+        return run_single_tpm2_workflow(None, pcr_ids)
+
+    if not Path(device).exists():
+        return False, f"Le périphérique {device} n'existe pas"
+
     try:
-        r = subprocess.run(cmd, timeout=120)
-        if r.returncode == 0:
-            return True, "Liaison systemd-cryptenroll réussie"
-        return False, f"systemd-cryptenroll a échoué (code {r.returncode})"
-    except subprocess.TimeoutExpired:
-        return False, "Timeout"
+        return run_single_tpm2_workflow(device, pcr_ids)
     except Exception as e:
         return False, str(e)
 
@@ -317,7 +342,7 @@ def cmd_list(args):
 def cmd_bind(args):
     check_root()
     device = args.device
-    pcr_ids = args.pcr or '7'
+    pcr_ids = args.pcr or '0+2+4+7'
 
     print(f"=== Liaison TPM2 : {device} ===\n")
 
@@ -459,8 +484,8 @@ def main():
 
     p_bind = sub.add_parser('bind', help='Lier une partition LUKS au TPM2')
     p_bind.add_argument('device', help='Ex: /dev/sda5')
-    p_bind.add_argument('--pcr', default='7',
-                        help='PCR IDs à utiliser (défaut: 7). Ex: 0,1,7')
+    p_bind.add_argument('--pcr', default='0+2+4+7',
+                        help='PCR IDs à utiliser (défaut: 0+2+4+7). Ex: 0,1,7')
     p_bind.set_defaults(func=cmd_bind)
 
     p_unbind = sub.add_parser('unbind', help='Supprimer la liaison TPM2')
